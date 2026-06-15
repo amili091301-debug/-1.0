@@ -384,7 +384,7 @@ function validate(){{var sid=document.getElementById('sid').value.trim(),nm=docu
 </script>
 </body></html>'''
 
-def teacher_config_page(courses, current_config, classes, error=None, success=None, has_config=False):
+def teacher_config_page(courses, current_config, classes, url_class_filter="", error=None, success=None, has_config=False):
     err_html = f'<p style="color:#e74c3c;text-align:center;margin-bottom:8px">{error}</p>' if error else ''
     suc_html = f'<p style="color:#27ae60;text-align:center;margin-bottom:8px">{success}</p>' if success else ''
 
@@ -393,7 +393,7 @@ def teacher_config_page(courses, current_config, classes, error=None, success=No
         for c in courses)
 
     # Class dropdown
-    class_filter = current_config.get('class_filter', '')
+    class_filter = url_class_filter
     class_options = '<option value="">全部班级（一起上课）</option>' + ''.join(
         f'<option value="{cl}" {"selected" if cl==class_filter else ""}>{cl}</option>'
         for cl in classes)
@@ -767,20 +767,17 @@ def get_session(cookie_str):
 def get_config(conn, course_id=None, class_filter=None):
     conn.row_factory = sqlite3.Row
     if course_id:
-        # Look for config matching course + class; fall back to all-classes config
+        # First try exact (course_id, class_filter) match
+        row = conn.execute('SELECT * FROM attendance_config WHERE course_id=? AND class_filter=? LIMIT 1',
+                           (course_id, class_filter or '')).fetchone()
+        if row:
+            return row
+        # Fall back to all-classes config for this course
         if class_filter:
-            row = conn.execute('SELECT * FROM attendance_config WHERE course_id=? AND class_filter=? LIMIT 1',
-                               (course_id, class_filter)).fetchone()
-            if row:
-                return row
-            # Fall back to all-classes config
             row = conn.execute('SELECT * FROM attendance_config WHERE course_id=? AND class_filter=? LIMIT 1',
                                (course_id, '')).fetchone()
             return row if row else None
-        # class_filter is empty/None: look for all-classes config
-        row = conn.execute('SELECT * FROM attendance_config WHERE course_id=? AND class_filter=? LIMIT 1',
-                           (course_id, '')).fetchone()
-        return row if row else None
+        return None
     return conn.execute('SELECT * FROM attendance_config LIMIT 1').fetchone()
 
 def get_courses(conn):
@@ -797,6 +794,62 @@ def get_student_course(conn, student_id):
     if row:
         return row
     return conn.execute('SELECT id, course_name FROM courses LIMIT 1').fetchone()
+
+def parse_xlsx(file_bytes):
+    """解析 .xlsx 文件为 CSV 文本。纯 stdlib，零依赖。"""
+    import zipfile, xml.etree.ElementTree as ET, io, re
+
+    NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as z:
+            # 1. Shared strings
+            shared = []
+            if 'xl/sharedStrings.xml' in z.namelist():
+                tree = ET.parse(z.open('xl/sharedStrings.xml'))
+                for si in tree.findall(f'.//{{{NS}}}si'):
+                    parts = [t.text or '' for t in si.findall(f'.//{{{NS}}}t')]
+                    shared.append(''.join(parts))
+
+            # 2. Sheet data - use findall with explicit path to avoid iter() hang
+            tree = ET.parse(z.open('xl/worksheets/sheet1.xml'))
+            sheet_data = tree.find(f'.//{{{NS}}}sheetData')
+            if sheet_data is None:
+                return None
+
+            # 3. Process rows
+            rows_out = []
+            for row_elem in sheet_data.findall(f'{{{NS}}}row'):
+                cells = {}
+                for c in row_elem.findall(f'{{{NS}}}c'):
+                    ref = c.get('r', '')
+                    t = c.get('t', '')
+                    v = c.find(f'{{{NS}}}v')
+                    if v is None or v.text is None:
+                        continue
+                    m = re.match(r'([A-Z]+)(\d+)', ref)
+                    if not m:
+                        continue
+                    col, _ = m.group(1), m.group(2)
+
+                    if t == 's':
+                        idx = int(v.text)
+                        cells[col] = shared[idx] if idx < len(shared) else ''
+                    else:
+                        cells[col] = v.text
+
+                if not cells:
+                    continue
+                # Sort by column letter
+                sorted_cols = sorted(cells.keys(), key=lambda x: (len(x), x))
+                line = ','.join(str(cells[c]) for c in sorted_cols)
+                if line.strip():
+                    rows_out.append(line)
+
+            return '\n'.join(rows_out) if rows_out else ''
+
+    except Exception:
+        return None
+
 
 def parse_multipart(content_type, body):
     """解析 multipart/form-data，返回 {field_name: value} 字典。
@@ -903,7 +956,7 @@ def batch_import_page(course, results=None):
 <code>223050001,张三,大数据管理2301班</code><br>
 <code>223050002,李四,大数据管理2301班</code><br>
 <code>223050003,王五,大数据管理2302班</code><br><br>
-⚠️ 支持 CSV/TXT 文件，编码 UTF-8。<br>
+⚠️ 支持 CSV / TXT / Excel(.xlsx) 文件。<br>
 ⚠️ 如遇到乱码，请将 Excel 另存为 CSV UTF-8 格式。
 </div>
 {result_html}
@@ -914,14 +967,14 @@ def batch_import_page(course, results=None):
 <div style="font-size:40px;margin-bottom:8px">📂</div>
 <div style="font-size:15px;color:#666" id="fileLabel">点击选择文件或拖拽到此处</div>
 <div style="font-size:12px;color:#999;margin-top:4px">支持 .csv / .txt 文件</div>
-<input type="file" name="csv_file" accept=".csv,.txt" id="fileInput" onchange="updateLabel()" style="display:none">
+<input type="file" name="csv_file" accept=".csv,.txt,.xlsx" id="fileInput" onchange="updateLabel()" style="display:none">
 </label>
 <button class="btn" type="submit" style="background:linear-gradient(135deg,#27ae60,#2ecc71)">🚀 开始导入</button>
 </form>
 </div></div>
 <script>
 function updateLabel(){{var f=document.getElementById('fileInput').files[0];document.getElementById('fileLabel').innerText=f?f.name:'点击选择文件或拖拽到此处'}}
-document.getElementById('dropZone').addEventListener('click',function(){{document.getElementById('fileInput').click()}})
+// dropZone click handled by native label behavior (no JS needed)
 function handleDrop(e){{e.preventDefault();var f=e.dataTransfer.files[0];document.getElementById('fileInput').files=e.dataTransfer.files;if(f)document.getElementById('fileLabel').innerText=f.name}}
 function toggleDetail(){{var t=document.getElementById('detailTable');if(t.className.indexOf('show')>=0){{t.className='detail-table';document.getElementById('detailLink').innerHTML='查看详情 ▼'}}else{{t.className='detail-table show';document.getElementById('detailLink').innerHTML='收起详情 ▲'}}}}
 </script>
@@ -1234,6 +1287,9 @@ class SignHandler(http.server.BaseHTTPRequestHandler):
             return
 
         conn = sqlite3.connect(DB)
+        if not class_filter:
+            # All classes: delete any class-specific configs for this course
+            conn.execute('DELETE FROM attendance_config WHERE course_id=? AND class_filter!=?', (course_id, ''))
         # Upsert config for this (course, class) pair
         existing = conn.execute('SELECT id FROM attendance_config WHERE course_id=? AND class_filter=?',
                                 (course_id, class_filter)).fetchone()
@@ -1562,7 +1618,7 @@ class SignHandler(http.server.BaseHTTPRequestHandler):
 
         error = '请先选择课程' if qs.get('error') else None
         success = '设置已保存' if qs.get('success') else None
-        self._send_html(teacher_config_page(courses, config, classes, error=error, success=success, has_config=has_config))
+        self._send_html(teacher_config_page(courses, config, classes, url_class_filter=class_filter, error=error, success=success, has_config=has_config))
 
     def _serve_manage_students(self, qs):
         course_id = int(qs.get('course_id', ['0'])[0])
@@ -1650,21 +1706,31 @@ class SignHandler(http.server.BaseHTTPRequestHandler):
         course['student_count'] = conn.execute('SELECT COUNT(*) FROM course_students WHERE course_id=?', (course_id,)).fetchone()[0]
 
         if not file_content:
-            # No file uploaded - show form again with error
             conn.close()
             self._send_html(batch_import_page(course, {'added': 0, 'skipped': 0, 'errors': 0, 'details': []}))
             return
 
-        # Try decode
-        try:
-            csv_text = file_content.decode('utf-8')
-        except UnicodeDecodeError:
-            try:
-                csv_text = file_content.decode('gbk')
-            except:
+        # Check if it's an Excel file — try to parse it directly
+        if file_content[:2] == b'PK':
+            csv_text = parse_xlsx(file_content)
+            if csv_text is None or not csv_text.strip():
                 conn.close()
                 self._send_html(batch_import_page(course, {'added': 0, 'skipped': 0, 'errors': 0, 'details': [
-                    {'status': '编码错误', 'student_id': '', 'name': '文件编码无法识别，请另存为 UTF-8'}]}))
+                    {'status': '格式错误', 'student_id': '', 'name': '无法解析 Excel 文件，请确认文件未损坏，或另存为 CSV UTF-8 格式再上传'}]}))
+                return
+        else:
+            # Try decode — try multiple common Chinese encodings
+            csv_text = None
+            for enc in ['utf-8-sig', 'utf-8', 'gb18030', 'gbk', 'gb2312']:
+                try:
+                    csv_text = file_content.decode(enc)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            if csv_text is None:
+                conn.close()
+                self._send_html(batch_import_page(course, {'added': 0, 'skipped': 0, 'errors': 0, 'details': [
+                    {'status': '编码错误', 'student_id': '', 'name': '无法识别文件编码，请用 Excel 打开后"另存为"→ CSV UTF-8 格式再上传'}]}))
                 return
 
         existing_classes = set(r[0] for r in conn.execute('SELECT class_name FROM classes').fetchall())
@@ -1674,54 +1740,58 @@ class SignHandler(http.server.BaseHTTPRequestHandler):
         errors = 0
         details = []
 
-        # Detect BOM and skip header row
-        lines = csv_text.split('\n')
-        for i, line in enumerate(lines):
-            line = line.strip().lstrip('\ufeff')  # Remove BOM
-            if not line:
-                continue
-            # Try comma, then tab
-            parts = [p.strip() for p in line.split(',')]
-            if len(parts) < 3:
-                parts = [p.strip() for p in line.split('\t')]
-            # Skip header row
-            if i == 0 and (parts[0] == '学号' or parts[0].lower() == 'student_id'):
-                continue
-            if len(parts) < 3:
-                errors += 1
-                details.append({'status': '格式错误', 'student_id': line[:20], 'name': ''})
-                continue
+        try:
+            # Detect BOM and skip header row
+            lines = csv_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            for i, line in enumerate(lines):
+                line = line.strip().lstrip('\ufeff')  # Remove BOM
+                if not line:
+                    continue
+                # Try comma, then tab
+                parts = [p.strip().strip('"') for p in line.split(',')]  # also strip quotes
+                if len(parts) < 3:
+                    parts = [p.strip().strip('"') for p in line.split('\t')]
+                # Skip header row
+                if i == 0 and (parts[0] == '学号' or parts[0].lower() == 'student_id'):
+                    continue
+                if len(parts) < 3:
+                    errors += 1
+                    details.append({'status': '格式错误', 'student_id': line[:20], 'name': ''})
+                    continue
 
-            student_id, student_name, class_name = parts[0], parts[1], parts[2]
-            if not student_id or not student_name or not class_name:
-                errors += 1
-                details.append({'status': '格式错误', 'student_id': student_id or '?', 'name': student_name or '?'})
-                continue
+                student_id, student_name, class_name = parts[0], parts[1], parts[2]
+                if not student_id or not student_name or not class_name:
+                    errors += 1
+                    details.append({'status': '格式错误', 'student_id': student_id or '?', 'name': student_name or '?'})
+                    continue
 
-            enrolled = conn.execute('SELECT id FROM course_students WHERE course_id=? AND student_id=?',
-                                     (course_id, student_id)).fetchone()
-            if enrolled:
-                skipped += 1
-                details.append({'status': '已跳过', 'student_id': student_id, 'name': student_name})
-                continue
+                enrolled = conn.execute('SELECT id FROM course_students WHERE course_id=? AND student_id=?',
+                                         (course_id, student_id)).fetchone()
+                if enrolled:
+                    skipped += 1
+                    details.append({'status': '已跳过', 'student_id': student_id, 'name': student_name})
+                    continue
 
-            if class_name not in existing_classes:
-                conn.execute('INSERT INTO classes (class_name) VALUES (?)', (class_name,))
-                existing_classes.add(class_name)
+                if class_name not in existing_classes:
+                    conn.execute('INSERT INTO classes (class_name) VALUES (?)', (class_name,))
+                    existing_classes.add(class_name)
 
-            existing = conn.execute('SELECT * FROM students WHERE student_id=?', (student_id,)).fetchone()
-            if not existing:
-                conn.execute('INSERT INTO students (student_id, name, class_name) VALUES (?,?,?)',
-                            (student_id, student_name, class_name))
-                conn.execute('INSERT OR IGNORE INTO users (username, password, role, student_id) VALUES (?,?,?,?)',
-                            (student_id, '123456', 'student', student_id))
+                existing = conn.execute('SELECT * FROM students WHERE student_id=?', (student_id,)).fetchone()
+                if not existing:
+                    conn.execute('INSERT INTO students (student_id, name, class_name) VALUES (?,?,?)',
+                                (student_id, student_name, class_name))
+                    conn.execute('INSERT OR IGNORE INTO users (username, password, role, student_id) VALUES (?,?,?,?)',
+                                (student_id, '123456', 'student', student_id))
 
-            conn.execute('INSERT OR IGNORE INTO course_students (course_id, student_id) VALUES (?,?)',
-                        (course_id, student_id))
-            added += 1
-            details.append({'status': '已添加', 'student_id': student_id, 'name': student_name})
+                conn.execute('INSERT OR IGNORE INTO course_students (course_id, student_id) VALUES (?,?)',
+                            (course_id, student_id))
+                added += 1
+                details.append({'status': '已添加', 'student_id': student_id, 'name': student_name})
 
-        conn.commit()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            details.append({'status': '系统错误', 'student_id': '', 'name': str(e)[:100]})
         conn.close()
         results = {'added': added, 'skipped': skipped, 'errors': errors, 'details': details}
         self._send_html(batch_import_page(course, results))
